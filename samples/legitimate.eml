@@ -1,0 +1,31 @@
+Return-Path: <noreply@example.org>
+Received: from mail-out-02.example.org (mail-out-02.example.org [198.51.100.9])
+	by mx.example.org (Postfix) with ESMTPS id 71C0D3B21
+	for <andi.pratama@example.org>; Tue, 15 Sep 2026 08:02:11 +0700 (WIB)
+Authentication-Results: mx.example.org;
+	spf=pass smtp.mailfrom=example.org;
+	dkim=pass header.d=example.org header.s=selector1;
+	dmarc=pass action=none header.from=example.org
+Message-ID: <a71f2c40-4d7a-11f1-9b3e-0242ac130002@example.org>
+Date: Tue, 15 Sep 2026 08:02:08 +0700
+From: "IT Helpdesk" <noreply@example.org>
+To: andi.pratama@example.org
+Subject: Jadwal pemeliharaan sistem Sabtu 20 September
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+
+Halo Andi,
+
+Kami akan melakukan pemeliharaan terjadwal pada hari Sabtu,
+20 September 2026, pukul 22.00 sampai 02.00 WIB.
+
+Selama periode tersebut portal internal tidak dapat diakses.
+Rincian lengkap ada di halaman status kami:
+
+    https://status.example.org/maintenance/2026-09-20
+
+Tidak ada tindakan yang perlu Anda lakukan.
+
+Salam,
+IT Helpdesk
