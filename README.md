@@ -78,12 +78,28 @@ tanpa risiko terklik tidak sengaja.
 | `attachment-executable` | high | Lampiran `.exe`, `.js`, `.vbs`, `.lnk`, dan sejenisnya |
 | `attachment-html` | high | Lampiran HTML, pola halaman login palsu offline |
 | `attachment-double-ext` | high | `invoice.pdf.exe` dan variasinya |
+| `attachment-macro` | high | Dokumen Office bermakro (`.docm`, `.xlsm`, `.pptm`) |
+| `brand-impersonation` | high | Nama tampilan mengaku merek tertentu, domain pengirim bukan miliknya |
+| `brand-in-domain` / `brand-in-url` | high | Nama merek ditanam pada domain asing: `login-microsoft.example.com` |
+| `lookalike-domain` / `lookalike-url` | high | Domain tiruan satu-dua karakter: `paypa1.com`, `m1crosoft.com` |
+| `html-form-external` | high | Badan email memuat formulir yang mengirim isian ke situs luar |
+| `html-password-input` | high | Ada kolom kata sandi langsung di badan email |
+| `html-script` | high | Badan email memuat `<script>` |
+| `html-meta-refresh` | high | Pengalihan otomatis lewat `meta refresh` |
+| `html-data-uri` | high | Tautan atau sumber berupa `data:` URI |
 | `replyto-mismatch` | medium | Domain Reply-To berbeda dari From |
 | `returnpath-mismatch` | medium | Domain Return-Path berbeda dari From |
 | `spf-weak` / `dkim-missing` | medium | Hasil none, neutral, atau permerror |
 | `url-shortener` | medium | Tautan disembunyikan di balik pemendek URL |
 | `attachment-container` | medium | Arsip `.iso`, `.img`, `.7z`, `.rar` |
+| `thread-spoof` | medium | Subjek `RE:`/`FW:` tanpa `In-Reply-To` maupun `References` |
+| `messageid-missing` | medium | Tidak ada `Message-ID`, lazim pada email hasil skrip |
+| `html-hidden-text` | medium | Teks disembunyikan (`font-size:0`, `display:none`) untuk mengecoh filter |
+| `html-form` | medium | Formulir tanpa tujuan yang jelas |
 | `url-plaintext` | low | Tautan `http://` tanpa enkripsi |
+| `messageid-mismatch` | low | `Message-ID` dibuat di domain lain daripada `From` |
+| `subject-lure` | low | Subjek memakai dua kata pemancing atau lebih |
+| `tracking-pixel` | low | Gambar 1x1 untuk memastikan alamat aktif |
 | `spf-missing` / `dmarc-missing` | low | Header autentikasi tidak ada sama sekali |
 
 **Verdict** disusun dari temuan tersebut: satu temuan `high` langsung berarti
@@ -93,8 +109,21 @@ eskalasi, dua `medium` berarti perlu pemeriksaan lanjutan.
 
 ```bash
 python eml_triage.py samples/phishing.eml
-python eml_triage.py samples/*.eml
+python eml_triage.py samples/                      # seluruh .eml dalam folder
+python eml_triage.py samples/ --summary            # satu baris verdict per berkas
+python eml_triage.py laporan.eml --iocs            # hanya daftar IOC, sudah defanged
+python eml_triage.py laporan.eml --iocs --raw      # IOC apa adanya, untuk blocklist
 python eml_triage.py --json laporan.eml > laporan.json
+```
+
+`--summary` berguna saat laporan phishing masuk beberapa sekaligus:
+
+```
+BERKAS                            H  M  L  VERDICT
+------------------------------------------------------------------------------
+credential-harvest.eml            8  3  2  SUSPICIOUS - eskalasi ke L2
+legitimate.eml                    0  0  0  KEMUNGKINAN AMAN - tidak ada indikator kuat
+phishing.eml                      8  3  2  SUSPICIOUS - eskalasi ke L2
 ```
 
 Butuh Python 3.9 atau lebih baru. Tidak ada yang perlu dipasang.
@@ -115,8 +144,8 @@ python eml_triage.py --json --fail-on-suspicious inbox/*.eml > hasil.json || ech
 python -m unittest discover -s tests -v
 ```
 
-32 uji, mencakup setiap aturan deteksi, kedua berkas contoh, serta kasus
-email kosong dan email tanpa header autentikasi.
+75 uji, mencakup setiap aturan deteksi, ketiga berkas contoh, keluaran IOC dan
+ringkasan, serta kasus email kosong dan email tanpa header autentikasi.
 
 ## Batasan yang perlu diketahui
 
@@ -127,6 +156,11 @@ email kosong dan email tanpa header autentikasi.
 - **Penentuan domain terdaftar bersifat perkiraan** (dua label terakhir, dengan
   penanganan khusus untuk ccTLD bertingkat seperti `co.id`). Untuk presisi
   penuh, perlu daftar Public Suffix List.
+- **Daftar merek bersifat tetap dan terbatas.** `BRANDS` di dalam
+  `eml_triage.py` berisi merek yang paling sering ditiru; deteksi domain tiruan
+  memakai jarak edit satu-dua karakter, jadi tiruan yang lebih kreatif
+  (`micros0ft-support-id.com`) hanya tertangkap lewat aturan `brand-in-domain`.
+  Sesuaikan daftarnya dengan merek dan bank yang relevan di lingkungan sendiri.
 - **Tidak ada reputasi atau threat intel.** Alat ini tidak menghubungi layanan
   apa pun. URL dan hash yang dikumpulkan masih perlu dicek ke platform threat
   intelligence secara terpisah.
@@ -135,7 +169,7 @@ email kosong dan email tanpa header autentikasi.
 
 ## Catatan data
 
-Kedua berkas di `samples/` **dibuat sendiri untuk keperluan uji**. Seluruh
+Ketiga berkas di `samples/` **dibuat sendiri untuk keperluan uji**. Seluruh
 domain memakai rentang dokumentasi RFC 2606 (`example.org`, `example.net`) dan
 IP memakai rentang RFC 5737 (`198.51.100.0/24`, `203.0.113.0/24`).
 

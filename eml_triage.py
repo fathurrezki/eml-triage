@@ -29,10 +29,11 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from email.message import EmailMessage
 from email.utils import parseaddr, getaddresses
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # Ekstensi yang hampir tidak pernah wajar dikirim lewat email ke pengguna akhir.
 EXECUTABLE_EXT = {
@@ -56,6 +57,63 @@ ANCHOR_RE = re.compile(
 )
 TAG_RE = re.compile(r"<[^>]+>")
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+# Dokumen Office dengan makro: jalur utama pengiriman loader/stealer.
+MACRO_EXT = {"docm", "dotm", "xlsm", "xltm", "xlam", "xlsb", "pptm", "potm", "ppam", "sldm"}
+
+# Merek yang paling sering ditiru pada phishing beserta domain sahnya.
+BRANDS: dict[str, set[str]] = {
+    "microsoft": {"microsoft.com", "office.com", "office365.com", "outlook.com",
+                  "live.com", "microsoftonline.com", "sharepoint.com"},
+    "google": {"google.com", "gmail.com", "googlemail.com"},
+    "apple": {"apple.com", "icloud.com"},
+    "paypal": {"paypal.com"},
+    "amazon": {"amazon.com", "amazon.co.id", "amazonses.com"},
+    "netflix": {"netflix.com"},
+    "facebook": {"facebook.com", "fb.com"},
+    "instagram": {"instagram.com"},
+    "whatsapp": {"whatsapp.com"},
+    "linkedin": {"linkedin.com"},
+    "docusign": {"docusign.com", "docusign.net"},
+    "dropbox": {"dropbox.com"},
+    "adobe": {"adobe.com"},
+    "dhl": {"dhl.com"},
+    "fedex": {"fedex.com"},
+    "shopee": {"shopee.co.id", "shopee.com"},
+    "tokopedia": {"tokopedia.com"},
+    "bca": {"bca.co.id", "klikbca.com"},
+    "mandiri": {"bankmandiri.co.id"},
+    "bni": {"bni.co.id"},
+    "bri": {"bri.co.id"},
+}
+LEGIT_DOMAINS = {d for domains in BRANDS.values() for d in domains}
+
+# Angka/simbol yang dipakai meniru huruf. i, l, dan 1 dilebur jadi satu supaya
+# paypa1 dan m1crosoft sama-sama terbaca; merek pun dinormalkan dengan peta ini.
+HOMOGLYPHS = str.maketrans({"0": "o", "1": "i", "l": "i", "|": "i", "3": "e",
+                            "4": "a", "@": "a", "5": "s", "$": "s", "7": "t"})
+
+# Kata pemicu rasa panik. Satu kata saja lumrah, dua ke atas baru dicatat.
+LURE_TERMS = (
+    "verifikasi", "verify", "verification", "suspended", "diblokir", "dibekukan",
+    "segera", "urgent", "immediately", "action required", "tindakan diperlukan",
+    "kedaluwarsa", "expired", "kata sandi", "password", "konfirmasi ulang",
+    "reactivate", "aktifkan kembali", "dalam 24 jam", "within 24 hours",
+)
+
+FORM_ACTION_RE = re.compile(r"""<form\b[^>]*\baction\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
+FORM_RE = re.compile(r"<form\b", re.IGNORECASE)
+PASSWORD_INPUT_RE = re.compile(r"""<input\b[^>]*\btype\s*=\s*["']?password""", re.IGNORECASE)
+SCRIPT_RE = re.compile(r"<script\b", re.IGNORECASE)
+META_REFRESH_RE = re.compile(r"""<meta\b[^>]*http-equiv\s*=\s*["']?refresh""", re.IGNORECASE)
+IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+DIMENSION_RE = re.compile(r"""\b(width|height)\s*[=:]\s*["']?\s*(\d+)""", re.IGNORECASE)
+DATA_URI_RE = re.compile(r"""\b(?:href|src|action)\s*=\s*["']\s*(data:[^"']{10,})""", re.IGNORECASE)
+HIDDEN_STYLE_RE = re.compile(
+    r"(display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|pt)?\b"
+    r"|opacity\s*:\s*0(?:\.0+)?\b)",
+    re.IGNORECASE,
+)
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
@@ -91,12 +149,15 @@ class Report:
     from_display: str = ""
     reply_to: str = ""
     return_path: str = ""
+    in_reply_to: str = ""
+    references: str = ""
     to: list[str] = field(default_factory=list)
     auth_results: dict[str, str] = field(default_factory=dict)
     originating_ip: str = ""
     received_hops: int = 0
     urls: list[str] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
+    iocs: dict[str, list[str]] = field(default_factory=dict)
     findings: list[Finding] = field(default_factory=list)
     verdict: str = ""
 
@@ -144,6 +205,54 @@ def host_of(url: str) -> str:
     if stripped.startswith("["):             # IPv6 literal
         return stripped.split("]", 1)[0] + "]"
     return stripped.split(":", 1)[0].lower()
+
+
+def canonical(text: str) -> str:
+    """Menyederhanakan teks agar tiruan seperti "M1cr0s0ft" tetap terbaca."""
+    return re.sub(r"[^a-z]", "", text.lower().translate(HOMOGLYPHS))
+
+
+def edit_distance(a: str, b: str, cap: int = 2) -> int:
+    """Jarak Levenshtein yang berhenti begitu melewati cap (hemat waktu)."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+def brands_in(text: str) -> list[str]:
+    """Merek yang disebut pada sebuah teks (nama tampilan, domain, subjek)."""
+    if not text:
+        return []
+    low = text.lower()
+    canon = canonical(text)
+    hits = []
+    for brand in BRANDS:
+        if len(brand) <= 4:                  # bca, bni, bri, dhl: harus kata utuh
+            if re.search(rf"\b{re.escape(brand)}\b", low):
+                hits.append(brand)
+        elif canonical(brand) in canon:
+            hits.append(brand)
+    return hits
+
+
+def lookalike_of(domain: str) -> tuple[str, int]:
+    """Domain merek yang paling mirip dengan domain ini, bila memang mirip."""
+    if not domain or domain in LEGIT_DOMAINS:
+        return "", 0
+    for legit in sorted(LEGIT_DOMAINS):
+        cap = 1 if len(legit) <= 11 else 2
+        distance = edit_distance(domain, legit, cap)
+        if 0 < distance <= cap:
+            return legit, distance
+    return "", 0
 
 
 def extension_of(filename: str) -> str:
@@ -363,6 +472,8 @@ def check_attachments(attachments: list[Attachment]) -> list[Finding]:
 
         if ext in EXECUTABLE_EXT:
             findings.append(Finding("high", "attachment-executable", f"Lampiran dapat dieksekusi: {item.filename}"))
+        elif ext in MACRO_EXT:
+            findings.append(Finding("high", "attachment-macro", f"Dokumen Office bermakro: {item.filename}"))
         elif ext in HTML_EXT:
             findings.append(Finding("high", "attachment-html", f"Lampiran HTML, pola halaman login palsu: {item.filename}"))
         elif ext in CONTAINER_EXT:
@@ -373,6 +484,176 @@ def check_attachments(attachments: list[Attachment]) -> list[Finding]:
         if len(parts) >= 3 and parts[-2] in {"pdf", "doc", "docx", "xls", "xlsx", "jpg", "png", "txt"}:
             findings.append(Finding("high", "attachment-double-ext", f"Ekstensi ganda menyesatkan: {item.filename}"))
     return findings
+
+
+def check_brand(report: Report) -> list[Finding]:
+    """Penyamaran merek: nama tampilan, nama merek di domain, dan domain tiruan."""
+    findings = []
+    from_domain = registrable(domain_of(report.from_address))
+    if not from_domain:
+        return findings
+
+    for brand in brands_in(report.from_display):
+        if from_domain not in BRANDS[brand]:
+            findings.append(
+                Finding(
+                    "high",
+                    "brand-impersonation",
+                    f"Nama tampilan mengaku {brand.title()} tetapi domain pengirim {defang(from_domain)}",
+                )
+            )
+
+    for brand in brands_in(domain_of(report.from_address)):
+        if from_domain not in BRANDS[brand]:
+            findings.append(
+                Finding(
+                    "high",
+                    "brand-in-domain",
+                    f"Nama {brand.title()} dipasang pada domain asing {defang(from_domain)}",
+                )
+            )
+
+    legit, distance = lookalike_of(from_domain)
+    if legit:
+        findings.append(
+            Finding(
+                "high",
+                "lookalike-domain",
+                f"Domain pengirim {defang(from_domain)} mirip {defang(legit)} (beda {distance} karakter)",
+            )
+        )
+
+    checked: set[str] = set()
+    for url in report.urls:
+        host = host_of(url)
+        if not host or host in checked or IPV4_RE.fullmatch(host):
+            continue
+        checked.add(host)
+        base = registrable(host)
+        legit, distance = lookalike_of(base)
+        if legit:
+            findings.append(
+                Finding(
+                    "high",
+                    "lookalike-url",
+                    f"Host tautan {defang(base)} mirip {defang(legit)} (beda {distance} karakter)",
+                )
+            )
+            continue
+        for brand in brands_in(host):
+            if base not in BRANDS[brand]:
+                findings.append(
+                    Finding(
+                        "high",
+                        "brand-in-url",
+                        f"Nama {brand.title()} dipasang pada host tautan {defang(host)}",
+                    )
+                )
+    return findings
+
+
+def check_html_body(html: str) -> list[Finding]:
+    """Isi HTML: formulir pencuri kredensial, skrip, pengalihan, teks tersembunyi."""
+    findings = []
+    if not html:
+        return findings
+
+    for action in FORM_ACTION_RE.findall(html):
+        if action.lower().startswith(("http://", "https://")):
+            findings.append(
+                Finding(
+                    "high",
+                    "html-form-external",
+                    f"Badan email memuat formulir yang mengirim isian ke {defang(host_of(action))}",
+                )
+            )
+        elif action.lower().startswith("data:"):
+            findings.append(Finding("high", "html-form-external", "Formulir mengarah ke data: URI"))
+    if FORM_RE.search(html) and not FORM_ACTION_RE.search(html):
+        findings.append(Finding("medium", "html-form", "Badan email memuat formulir tanpa tujuan yang jelas"))
+    if PASSWORD_INPUT_RE.search(html):
+        findings.append(Finding("high", "html-password-input", "Ada kolom kata sandi langsung di badan email"))
+    if SCRIPT_RE.search(html):
+        findings.append(Finding("high", "html-script", "Badan email memuat <script>"))
+    if META_REFRESH_RE.search(html):
+        findings.append(Finding("high", "html-meta-refresh", "Badan email memaksa pengalihan otomatis (meta refresh)"))
+    for uri in DATA_URI_RE.findall(html):
+        findings.append(Finding("high", "html-data-uri", f"Tautan/sumber berupa data: URI ({uri[:40]}...)"))
+
+    if HIDDEN_STYLE_RE.search(html):
+        findings.append(Finding("medium", "html-hidden-text", "Ada teks yang disembunyikan dari pembaca"))
+
+    for tag in IMG_RE.findall(html):
+        dims = {k.lower(): int(v) for k, v in DIMENSION_RE.findall(tag)}
+        if dims.get("width", 99) <= 1 and dims.get("height", 99) <= 1:
+            findings.append(Finding("low", "tracking-pixel", "Ada piksel pelacak 1x1 di badan email"))
+            break
+    return findings
+
+
+def check_headers(report: Report) -> list[Finding]:
+    """Header non-autentikasi: balasan palsu, Message-ID, dan subjek pemancing."""
+    findings = []
+    subject = report.subject or ""
+
+    if re.match(r"\s*(re|fw|fwd)\s*:", subject, re.IGNORECASE) and not (
+        report.in_reply_to or report.references
+    ):
+        findings.append(
+            Finding("medium", "thread-spoof", "Subjek mengaku balasan tetapi tidak ada In-Reply-To/References")
+        )
+
+    if not report.message_id:
+        findings.append(Finding("medium", "messageid-missing", "Tidak ada Message-ID: lazim pada email hasil skrip"))
+    else:
+        mid_domain = registrable(domain_of(report.message_id.strip("<>")))
+        from_domain = registrable(domain_of(report.from_address))
+        if mid_domain and from_domain and mid_domain != from_domain:
+            findings.append(
+                Finding(
+                    "low",
+                    "messageid-mismatch",
+                    f"Message-ID dibuat di {defang(mid_domain)}, bukan {defang(from_domain)}",
+                )
+            )
+
+    low_subject = subject.lower()
+    hits = [term for term in LURE_TERMS if term in low_subject]
+    if len(hits) >= 2:
+        findings.append(
+            Finding("low", "subject-lure", "Subjek memakai kata pemancing: " + ", ".join(hits[:4]))
+        )
+    return findings
+
+
+def collect_iocs(report: Report) -> dict[str, list[str]]:
+    """IOC siap tempel ke tiket atau blocklist."""
+    hosts: set[str] = set()
+    ips: set[str] = set()
+    emails = {a for a in (report.from_address, report.reply_to, report.return_path) if a}
+
+    for url in report.urls:
+        host = host_of(url)
+        if not host:
+            continue
+        if IPV4_RE.fullmatch(host):
+            ips.add(host)
+        else:
+            hosts.add(host)
+    if report.originating_ip:
+        ips.add(report.originating_ip)
+    for address in list(emails):
+        domain = domain_of(address)
+        if domain:
+            hosts.add(domain)
+
+    return {
+        "urls": sorted(set(report.urls)),
+        "domains": sorted(hosts),
+        "ips": sorted(ips),
+        "emails": sorted(emails),
+        "sha256": sorted({a.sha256 for a in report.attachments}),
+    }
 
 
 def decide(findings: list[Finding]) -> str:
@@ -411,6 +692,8 @@ def analyze(raw: bytes, source: str = "-") -> Report:
         from_display=from_display,
         reply_to=reply_to.lower(),
         return_path=return_path.lower(),
+        in_reply_to=str(msg.get("In-Reply-To", "")),
+        references=str(msg.get("References", "")),
         to=[addr.lower() for _, addr in getaddresses([str(v) for v in msg.get_all("To", [])]) if addr],
         auth_results=parse_auth_results(msg),
         originating_ip=ip,
@@ -419,12 +702,22 @@ def analyze(raw: bytes, source: str = "-") -> Report:
         attachments=extract_attachments(msg),
     )
 
-    report.findings = (
+    report.iocs = collect_iocs(report)
+    raw_findings = (
         check_authentication(report.auth_results)
         + check_sender_alignment(report)
+        + check_brand(report)
+        + check_headers(report)
         + check_urls(report.urls, html)
+        + check_html_body(html)
         + check_attachments(report.attachments)
     )
+    seen: set[tuple[str, str, str]] = set()
+    for finding in raw_findings:            # aturan berbeda bisa menunjuk hal yang sama
+        key = (finding.severity, finding.rule, finding.detail)
+        if key not in seen:
+            seen.add(key)
+            report.findings.append(finding)
     report.findings.sort(key=lambda f: SEVERITY_ORDER.get(f.severity, 9))
     report.verdict = decide(report.findings)
     return report
@@ -489,13 +782,72 @@ def render_text(report: Report) -> str:
     return "\n".join(lines)
 
 
+def render_iocs(reports: list[Report], raw: bool = False) -> str:
+    """Daftar IOC gabungan, satu nilai per baris, siap disalin ke tiket."""
+    merged: dict[str, set[str]] = {}
+    for report in reports:
+        for key, values in report.iocs.items():
+            merged.setdefault(key, set()).update(values)
+
+    labels = {"urls": "URL", "domains": "DOMAIN", "ips": "IP",
+              "emails": "ALAMAT EMAIL", "sha256": "SHA256 LAMPIRAN"}
+    lines: list[str] = []
+    for key in ("urls", "domains", "ips", "emails", "sha256"):
+        values = sorted(merged.get(key, set()))
+        if not values:
+            continue
+        lines.append(f"# {labels[key]} ({len(values)})")
+        for value in values:
+            lines.append(value if raw or key == "sha256" else defang(value))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def render_summary(reports: list[Report]) -> str:
+    """Satu baris per berkas: jumlah temuan per tingkat lalu verdict."""
+    lines = [f"{'BERKAS':<32} {'H':>2} {'M':>2} {'L':>2}  VERDICT", "-" * 78]
+    for report in reports:
+        counts = {
+            level: sum(1 for f in report.findings if f.severity == level)
+            for level in ("high", "medium", "low")
+        }
+        name = Path(report.source).name
+        if len(name) > 32:
+            name = name[:29] + "..."
+        lines.append(
+            f"{name:<32} {counts['high']:>2} {counts['medium']:>2} {counts['low']:>2}  {report.verdict}"
+        )
+    return "\n".join(lines)
+
+
+def expand_paths(paths: list[str]) -> list[str]:
+    """Folder diperlakukan sebagai kumpulan .eml di dalamnya (tidak rekursif)."""
+    expanded: list[str] = []
+    for item in paths:
+        path = Path(item)
+        if path.is_dir():
+            expanded.extend(
+                str(child) for child in sorted(path.iterdir())
+                if child.is_file() and child.suffix.lower() == ".eml"
+            )
+        else:
+            expanded.append(item)
+    return expanded
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="eml-triage",
         description="Triase berkas .eml untuk analis SOC Level 1.",
     )
-    parser.add_argument("files", nargs="+", help="satu atau beberapa berkas .eml")
+    parser.add_argument("files", nargs="+", help="berkas .eml, atau folder berisi berkas .eml")
     parser.add_argument("--json", action="store_true", help="keluarkan laporan sebagai JSON")
+    parser.add_argument("--iocs", action="store_true",
+                        help="cetak hanya daftar IOC (URL, domain, IP, alamat, hash)")
+    parser.add_argument("--raw", action="store_true",
+                        help="jangan defang IOC, untuk diimpor ke blocklist")
+    parser.add_argument("--summary", action="store_true",
+                        help="satu baris verdict per berkas, cocok untuk banyak berkas")
     parser.add_argument(
         "--fail-on-suspicious",
         action="store_true",
@@ -504,8 +856,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
 
+    files = expand_paths(args.files)
+    if not files:
+        print("tidak ada berkas .eml yang cocok", file=sys.stderr)
+        return 2
+
     reports = []
-    for path in args.files:
+    for path in files:
         try:
             with open(path, "rb") as handle:
                 raw = handle.read()
@@ -517,6 +874,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         payload = [r.to_dict() for r in reports]
         print(json.dumps(payload if len(payload) > 1 else payload[0], indent=2, ensure_ascii=False))
+    elif args.iocs:
+        print(render_iocs(reports, raw=args.raw))
+    elif args.summary:
+        print(render_summary(reports))
     else:
         print("\n\n".join(render_text(r) for r in reports))
 

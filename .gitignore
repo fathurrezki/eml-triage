@@ -8,3 +8,6 @@ env/
 *.log
 .DS_Store
 .pytest_cache/
+
+# email asli untuk uji coba lokal - JANGAN pernah masuk repo
+inbox/
